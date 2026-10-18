@@ -13,40 +13,20 @@ const SETTINGS_PATH = join(homedir(), ".config/opencode/antigravity.json");
 
 // Limite de segurança de cota (80% de uso -> <= 20% restante)
 const DEFAULT_THRESHOLD_PERCENT = 80;
-const DEFAULT_PROJECT_ID = "rising-fact-p41fc";
+const DEFAULT_PROJECT_ID = "aicode-consumers";
 
-// Headers consistentes com o host real (elimina detecção de anomalia TCP / User-Agent no Google)
-function getHostPlatformHeaders() {
-  const isWin = process.platform === "win32";
-  const isMac = process.platform === "darwin";
-  const isArm = process.arch === "arm64";
+// Endpoints oficiais do Antigravity / Cloud Code (com fallback de sandbox daily)
+const ANTIGRAVITY_ENDPOINTS = [
+  "https://daily-cloudcode-pa.sandbox.googleapis.com",
+  "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+  "https://cloudcode-pa.googleapis.com",
+];
 
-  let userAgent;
-  let metadataPlatform;
-
-  if (isWin) {
-    userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36";
-    metadataPlatform = "WINDOWS";
-  } else if (isMac) {
-    userAgent = isArm
-      ? "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
-      : "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36";
-    metadataPlatform = "MACOS";
-  } else {
-    // Linux: O Google Antigravity não possui binário oficial para Linux.
-    // O cliente masqueradeia de forma consistente para evitar rejeição da API do Cloud Code.
-    userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36";
-    metadataPlatform = "WINDOWS";
-  }
-
-  return {
-    "User-Agent": userAgent,
-    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-    "Client-Metadata": JSON.stringify({ ideType: "ANTIGRAVITY", platform: metadataPlatform, pluginType: "GEMINI" }),
-  };
-}
-
-const PLATFORM_HEADERS = getHostPlatformHeaders();
+const PLATFORM_HEADERS = {
+  "User-Agent": "antigravity/1.11.5 windows/amd64",
+  "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+  "Client-Metadata": JSON.stringify({ ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" }),
+};
 
 // Variáveis de ambiente suportadas (padrão de mercado + aliases amigáveis)
 const OAUTH_TOKEN_ENV_VARS = [
@@ -320,76 +300,79 @@ function createAntigravityTransformStream() {
   });
 }
 
-export default {
-  id: "antigravity",
-  async setup(ctx) {
-    console.log("[Antigravity] Plugin OpenCode v2 inicializado com SQP (Strict Quota Protocol 80%).");
+function extractUrl(input) {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  if (input && typeof input === "object") {
+    if ("href" in input && typeof input.href === "string") return input.href;
+    if ("url" in input && typeof input.url === "string") return input.url;
+  }
+  return String(input || "");
+}
 
-    const originalFetch = globalThis.fetch;
+let isPatched = false;
+function patchFetch() {
+  if (isPatched) return;
+  isPatched = true;
 
-    globalThis.fetch = async function (input, init) {
-      const url = typeof input === "string" ? input : (input?.url || "");
+  const originalFetch = globalThis.fetch;
 
-      if (url.includes("generativelanguage.googleapis.com")) {
-        const match = url.match(/\/models\/([^:]+):(\w+)/);
-        if (match) {
-          const [, rawModel, rawAction] = match;
-          const actualModel = resolveModel(rawModel);
-          const isStreaming = rawAction === "streamGenerateContent" || url.includes("alt=sse");
+  globalThis.fetch = async function (input, init) {
+    const url = extractUrl(input);
 
-          const settings = loadSettings();
-          const thresholdPercent = settings.soft_quota_threshold_percent || DEFAULT_THRESHOLD_PERCENT;
-          const minRemainingFraction = (100 - thresholdPercent) / 100;
+    if (url.includes("generativelanguage.googleapis.com")) {
+      const match = url.match(/\/models\/([^:]+):(\w+)/);
+      if (match) {
+        const [, rawModel, rawAction] = match;
+        const actualModel = resolveModel(rawModel);
+        const isStreaming = rawAction === "streamGenerateContent" || url.includes("alt=sse");
 
-          const storage = loadAccounts();
-          const accounts = storage.accounts || [];
+        const settings = loadSettings();
+        const thresholdPercent = settings.soft_quota_threshold_percent || DEFAULT_THRESHOLD_PERCENT;
+        const minRemainingFraction = (100 - thresholdPercent) / 100;
 
-          if (accounts.length > 0) {
-            let selectedIndex = storage.activeIndex || 0;
-            if (selectedIndex >= accounts.length) selectedIndex = 0;
+        const storage = loadAccounts();
+        const accounts = storage.accounts || [];
 
-            let selectedAccount = accounts[selectedIndex];
-            let accessToken = null;
+        // Filtra preferencialmente contas OAuth com refreshToken
+        const oauthAccounts = accounts.filter(a => a.refreshToken);
+        const candidates = oauthAccounts.length > 0 ? oauthAccounts : accounts;
 
+        if (candidates.length > 0) {
+          let selectedAccount = null;
+          let accessToken = null;
+          let selectedIndex = 0;
+
+          for (let i = 0; i < candidates.length; i++) {
+            const acc = candidates[i];
             try {
-              accessToken = await getValidAccessToken(selectedAccount, selectedIndex);
+              const token = await getValidAccessToken(acc, i);
+              const quota = await fetchAccountQuota(acc, i, token);
+              if (quota.remainingFraction > minRemainingFraction) {
+                selectedAccount = acc;
+                accessToken = token;
+                selectedIndex = i;
+                break;
+              }
             } catch (err) {
-              if (accounts.length > 1) {
-                selectedIndex = (selectedIndex + 1) % accounts.length;
-                selectedAccount = accounts[selectedIndex];
-                accessToken = await getValidAccessToken(selectedAccount, selectedIndex);
-              } else {
-                throw err;
-              }
+              // Tenta próxima conta
             }
+          }
 
-            let quota = await fetchAccountQuota(selectedAccount, selectedIndex, accessToken);
-
-            if (quota.remainingFraction <= minRemainingFraction) {
-              if (accounts.length > 1) {
-                const alternateIndex = (selectedIndex + 1) % accounts.length;
-                const alternateAccount = accounts[alternateIndex];
-                const alternateToken = await getValidAccessToken(alternateAccount, alternateIndex);
-                const alternateQuota = await fetchAccountQuota(alternateAccount, alternateIndex, alternateToken);
-
-                if (alternateQuota.remainingFraction > minRemainingFraction) {
-                  selectedIndex = alternateIndex;
-                  selectedAccount = alternateAccount;
-                  accessToken = alternateToken;
-                  quota = alternateQuota;
-                  storage.activeIndex = alternateIndex;
-                  saveAccounts(storage);
-                } else {
-                  const reset1 = quota.resetTime ? Date.parse(quota.resetTime) : Date.now() + (5 * 3600 * 1000);
-                  const reset2 = alternateQuota.resetTime ? Date.parse(alternateQuota.resetTime) : Date.now() + (5 * 3600 * 1000);
-                  const waitMs = Math.max(0, Math.min(reset1, reset2) - Date.now());
-                  throw new Error(`[Antigravity Quota Protection] Ambas as contas atingiram 80% de consumo. Reset em ${formatCountdown(waitMs)}.`);
-                }
-              }
+          if (!selectedAccount) {
+            // Se todas estiverem acima de 80%, usa a primeira válida
+            for (let i = 0; i < candidates.length; i++) {
+              try {
+                const token = await getValidAccessToken(candidates[i], i);
+                selectedAccount = candidates[i];
+                accessToken = token;
+                selectedIndex = i;
+                break;
+              } catch {}
             }
+          }
 
-            const targetEndpoint = `https://cloudcode-pa.googleapis.com/v1internal:${rawAction}${isStreaming ? "?alt=sse" : ""}`;
-
+          if (selectedAccount && accessToken) {
             let originalBody = {};
             if (typeof init?.body === "string" && init.body) {
               try { originalBody = JSON.parse(init.body); } catch {}
@@ -402,11 +385,7 @@ export default {
             };
 
             const headers = new Headers(init?.headers || {});
-            if (accessToken) {
-              headers.set("Authorization", `Bearer ${accessToken}`);
-            } else if (selectedAccount.apiKey) {
-              headers.set("x-goog-api-key", selectedAccount.apiKey);
-            }
+            headers.set("Authorization", `Bearer ${accessToken}`);
             headers.set("Content-Type", "application/json");
             headers.set("User-Agent", PLATFORM_HEADERS["User-Agent"]);
             headers.set("X-Goog-Api-Client", PLATFORM_HEADERS["X-Goog-Api-Client"]);
@@ -415,53 +394,61 @@ export default {
             headers.delete("x-api-key");
             headers.delete("x-goog-api-key");
 
-            const res = await originalFetch(targetEndpoint, {
-              method: "POST",
-              headers,
-              body: JSON.stringify(wrappedBody),
-              signal: init?.signal
-            });
-
-            if (!res.ok) {
-              return res;
-            }
-
-            if (isStreaming && res.body) {
-              const transformStream = createAntigravityTransformStream();
-              const transformedBody = res.body.pipeThrough(transformStream);
-              return new Response(transformedBody, {
-                status: res.status,
-                statusText: res.statusText,
-                headers: res.headers
-              });
-            } else {
-              const text = await res.text();
+            for (const baseEndpoint of ANTIGRAVITY_ENDPOINTS) {
               try {
-                const parsed = JSON.parse(text);
-                if (parsed && parsed.response !== undefined) {
-                  return new Response(JSON.stringify(parsed.response), {
-                    status: res.status,
-                    statusText: res.statusText,
-                    headers: res.headers
-                  });
+                const targetEndpoint = `${baseEndpoint}/v1internal:${rawAction}${isStreaming ? "?alt=sse" : ""}`;
+                const res = await originalFetch(targetEndpoint, {
+                  method: "POST",
+                  headers,
+                  body: JSON.stringify(wrappedBody),
+                  signal: init?.signal
+                });
+
+                if (res.ok) {
+                  if (isStreaming && res.body) {
+                    const transformStream = createAntigravityTransformStream();
+                    const transformedBody = res.body.pipeThrough(transformStream);
+                    return new Response(transformedBody, {
+                      status: res.status,
+                      statusText: res.statusText,
+                      headers: res.headers
+                    });
+                  } else {
+                    const text = await res.text();
+                    try {
+                      const parsed = JSON.parse(text);
+                      if (parsed && parsed.response !== undefined) {
+                        return new Response(JSON.stringify(parsed.response), {
+                          status: res.status,
+                          statusText: res.statusText,
+                          headers: res.headers
+                        });
+                      }
+                    } catch {}
+                    return new Response(text, {
+                      status: res.status,
+                      statusText: res.statusText,
+                      headers: res.headers
+                    });
+                  }
                 }
               } catch {}
-              return new Response(text, {
-                status: res.status,
-                statusText: res.statusText,
-                headers: res.headers
-              });
             }
           }
         }
       }
+    }
 
-      return originalFetch.apply(this, arguments);
-    };
+    return originalFetch(input, init);
+  };
+}
 
-    return () => {
-      globalThis.fetch = originalFetch;
-      console.log("[Antigravity] Plugin finalizado/descarregado.");
-    };
+// Aplica o patch imediatamente no carregamento do módulo
+patchFetch();
+
+export default {
+  id: "antigravity",
+  setup(ctx) {
+    patchFetch();
   }
 };
