@@ -45,3 +45,10 @@ CLIProxyAPI/
 LLM-API-Key-Proxy/
 opencode/
 opencode-better-antigravity-auth/
+
+# Credentials & local state
+antigravity-accounts.json*
+antigravity.json
+antigravity-signature-cache.json
+*.key
+.dev-local/

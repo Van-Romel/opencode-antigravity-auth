@@ -9,14 +9,18 @@
     "author": "noefabris",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/NoeFabris/opencode-antigravity-auth.git"
+        "url": "git+https://github.com/Van-Romel/opencode-antigravity-auth.git"
     },
-    "homepage": "https://github.com/NoeFabris/opencode-antigravity-auth#readme",
+    "homepage": "https://github.com/Van-Romel/opencode-antigravity-auth#readme",
     "bugs": {
-        "url": "https://github.com/NoeFabris/opencode-antigravity-auth/issues"
+        "url": "https://github.com/Van-Romel/opencode-antigravity-auth/issues"
+    },
+    "bin": {
+        "opencode-antigravity-auth": "./bin/auth-cli.mjs"
     },
     "keywords": [
         "opencode",
+        "opencode-v2",
         "google",
         "antigravity",
         "gemini",
@@ -30,6 +34,8 @@
     },
     "files": [
         "dist/",
+        "plugins/",
+        "bin/",
         "README.md",
         "LICENSE"
     ],

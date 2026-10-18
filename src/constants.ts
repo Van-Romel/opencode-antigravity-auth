@@ -136,7 +136,9 @@ export function getRandomizedHeaders(style: HeaderStyle, model?: string): Header
       "Client-Metadata": GEMINI_CLI_HEADERS["Client-Metadata"],
     };
   }
-  const platform = randomFrom(ANTIGRAVITY_PLATFORMS);
+  const platform = process.platform === "win32"
+    ? "windows/amd64"
+    : (process.platform === "darwin" ? (process.arch === "arm64" ? "darwin/arm64" : "darwin/amd64") : randomFrom(ANTIGRAVITY_PLATFORMS));
   const metadataPlatform = platform.startsWith("windows") ? "WINDOWS" : "MACOS";
   return {
     "User-Agent": `antigravity/${getAntigravityVersion()} ${platform}`,

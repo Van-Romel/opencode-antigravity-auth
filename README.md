@@ -18,6 +18,33 @@ Enable Opencode to authenticate against **Antigravity** (Google's IDE) via OAuth
 - **Auto-recovery** — handles session errors and tool failures automatically
 - **Plugin compatible** — works alongside other OpenCode plugins (oh-my-opencode, dcp, etc.)
 
+### 🛡️ Fork Enhancements (OpenCode v2, Multi-Platform & Anti-Shadowban SQP)
+
+This fork is a modernized, hardened evolution of `opencode-antigravity-auth`, engineered specifically for **OpenCode v2** with proactive quota protection and host-aware anti-detection measures:
+
+#### 1. 🌐 Universal Multi-Platform Support (Windows, macOS, Linux)
+The original plugin picked random platform headers from an array, causing Windows machines to broadcast macOS (`darwin/arm64`) User-Agents 66% of the time. This TCP stack vs. HTTP header disparity was a primary trigger for Google's anti-abuse flags and shadowbans.
+- **Windows (10/11)**: Sends native `Windows NT 10.0; Win64; x64` Electron signatures with `platform: WINDOWS`.
+- **macOS (Intel & Apple Silicon)**: Detects `process.arch` and broadcasts authentic `Macintosh; Apple Silicon` or `Intel Mac OS X` with `platform: MACOS`.
+- **Linux**: Clean Linux signatures mapped to Cloud Code Assist specifications.
+
+#### 2. ⚡ Strict Quota Protocol (80% SQP)
+- **Proactive Rotation**: Switches traffic to a backup account as soon as the active account hits **80% quota consumption** (`remainingFraction <= 0.20`).
+- **Hermetic Double-Account Lock**: If all configured accounts exceed 80%, the plugin pauses requests locally and displays a precise countdown until the earliest quota reset (`Xh Ymin` or `Zmin`).
+- **No More HTTP 429**: By never exhausting 100% of the quota, your accounts avoid the harsh automated penalties and cooldowns associated with rate-limit tripping.
+
+#### 3. 🔑 Flexible & Generic Authentication (Multi-Option)
+You can use any of the following methods without altering your workflow:
+- **Interactive OAuth (Zero-Config)**: Run `node bin/auth-cli.mjs login` to authenticate via browser callback on port 51121 and automatically register the account.
+- **Standard Environment Variables**:
+  - **OAuth Refresh Token**: `ANTIGRAVITY_REFRESH_TOKEN` or `OPENCODE_ANTIGRAVITY_TOKEN` (legacy aliases supported).
+  - **Google Gemini API Key**: `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+- **Account File**: Existing configurations in `~/.config/opencode/antigravity-accounts.json` are loaded dynamically using the user's home directory.
+
+#### 4. 🚀 OpenCode v2 Native Drop-in Plugin
+- Includes `plugins/antigravity.js` designed for the OpenCode v2 plugin loader (`export default { id, setup }`).
+- Can be copied directly to `~/.config/opencode/plugins/` as a standalone, zero-dependency file.
+
 ---
 
 <details open>

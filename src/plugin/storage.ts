@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { execSync } from "node:child_process";
 import {
   existsSync,
   readFileSync,
@@ -13,7 +14,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import lockfile from "proper-lockfile";
-import type { HeaderStyle } from "../constants";
+import { ANTIGRAVITY_DEFAULT_PROJECT_ID, type HeaderStyle } from "../constants";
 import { createLogger } from "./logger";
 
 const log = createLogger("storage");
@@ -674,6 +675,18 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
       activeIndex = 0;
     }
 
+    // Auto-synchronize with environment variables (ANTIGRAVITY_REFRESH_TOKEN, OPENCODE_ANTIGRAVITY_TOKEN, APIKEYGOOGLEFOROPENCODE)
+    const envOAuthToken = resolveEnvOAuthToken();
+    if (envOAuthToken && !deduplicatedAccounts.some(a => a.refreshToken === envOAuthToken)) {
+      deduplicatedAccounts.unshift({
+        email: "primary-account",
+        refreshToken: envOAuthToken,
+        projectId: ANTIGRAVITY_DEFAULT_PROJECT_ID,
+        addedAt: Date.now(),
+        lastUsed: Date.now(),
+      });
+    }
+
     return {
       version: 4,
       accounts: deduplicatedAccounts,
@@ -683,11 +696,56 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
+      const envOAuthToken = resolveEnvOAuthToken();
+      if (envOAuthToken) {
+        return {
+          version: 4,
+          accounts: [{
+            email: "primary-account",
+            refreshToken: envOAuthToken,
+            projectId: ANTIGRAVITY_DEFAULT_PROJECT_ID,
+            addedAt: Date.now(),
+            lastUsed: Date.now(),
+          }],
+          activeIndex: 0,
+        };
+      }
       return null;
     }
     log.error("Failed to load account storage", { error: String(error) });
     return null;
   }
+}
+
+const OAUTH_TOKEN_ENV_VARS = [
+  "ANTIGRAVITY_REFRESH_TOKEN",
+  "OPENCODE_ANTIGRAVITY_TOKEN",
+  "APIKEYGOOGLEFOROPENCODE",
+] as const;
+
+function resolveEnvOAuthToken(): string | null {
+  for (const varName of OAUTH_TOKEN_ENV_VARS) {
+    const token = resolveEnvVar(varName);
+    if (token) return token;
+  }
+  return null;
+}
+
+function resolveEnvVar(name: string): string | null {
+  if (process.env[name] && process.env[name]!.trim()) {
+    return process.env[name]!.trim();
+  }
+  if (process.platform === "win32") {
+    try {
+      const out = execSync(`reg query HKCU\\Environment /v ${name}`, { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+      const line = out.split(/\r?\n/).find(l => l.includes(name));
+      if (line) {
+        const val = line.trim().split(/\s+/).pop();
+        if (val) return val.trim();
+      }
+    } catch {}
+  }
+  return null;
 }
 
 export async function saveAccounts(storage: AccountStorageV4): Promise<void> {

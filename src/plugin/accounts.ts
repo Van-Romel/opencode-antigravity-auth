@@ -509,7 +509,7 @@ export class AccountManager {
     strategy: AccountSelectionStrategy = 'sticky',
     headerStyle: HeaderStyle = 'antigravity',
     pidOffsetEnabled: boolean = false,
-    softQuotaThresholdPercent: number = 100,
+    softQuotaThresholdPercent: number = 80,
     softQuotaCacheTtlMs: number = 10 * 60 * 1000,
   ): ManagedAccount | null {
     const quotaKey = getQuotaKey(family, headerStyle, model);
@@ -589,7 +589,7 @@ export class AccountManager {
     return next;
   }
 
-  getNextForFamily(family: ModelFamily, model?: string | null, headerStyle: HeaderStyle = "antigravity", softQuotaThresholdPercent: number = 100, softQuotaCacheTtlMs: number = 10 * 60 * 1000): ManagedAccount | null {
+  getNextForFamily(family: ModelFamily, model?: string | null, headerStyle: HeaderStyle = "antigravity", softQuotaThresholdPercent: number = 80, softQuotaCacheTtlMs: number = 10 * 60 * 1000): ManagedAccount | null {
     const available = this.accounts.filter((a) => {
       clearExpiredRateLimits(a);
       return a.enabled !== false && 
