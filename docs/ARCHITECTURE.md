@@ -298,5 +298,6 @@ export OPENCODE_ANTIGRAVITY_DEBUG_TUI=1  # TUI log panel output
 
 ## See Also
 
+- [Architecture Decision Records (ADRs)](./adr/README.md) - Rationale and design records for v2 & anti-shadowban
 - [ANTIGRAVITY_API_SPEC.md](./ANTIGRAVITY_API_SPEC.md) - API reference
 - [README.md](../README.md) - Installation & usage

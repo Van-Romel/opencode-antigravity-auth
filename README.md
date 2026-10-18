@@ -755,6 +755,7 @@ See the full [Troubleshooting Guide](docs/TROUBLESHOOTING.md) for solutions to c
 
 ## Documentation
 
+- [Architecture Decision Records (ADRs)](docs/adr/README.md) — Rationale and design decisions for v2, anti-shadowban & security
 - [Configuration](docs/CONFIGURATION.md) — All configuration options
 - [Multi-Account](docs/MULTI-ACCOUNT.md) — Load balancing, dual quota pools, account storage
 - [Model Variants](docs/MODEL-VARIANTS.md) — Thinking budgets and variant system
