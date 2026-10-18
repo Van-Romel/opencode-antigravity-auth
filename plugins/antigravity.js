@@ -372,5 +372,12 @@ export default {
   id: "antigravity",
   setup(ctx) {
     startProxyServer();
+    if (ctx?.session?.hook) {
+      try {
+        ctx.session.hook("http.request", async () => {});
+        ctx.session.hook("http.response", async () => {});
+      } catch {}
+    }
+    return () => {};
   }
 };
