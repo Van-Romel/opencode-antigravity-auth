@@ -47,6 +47,11 @@ export const MODEL_ALIASES: Record<string, string> = {
   "gemini-3-flash-low": "gemini-3-flash",
   "gemini-3-flash-medium": "gemini-3-flash",
   "gemini-3-flash-high": "gemini-3-flash",
+  "gemini-3.8-flash": "gemini-3-flash",
+  "gemini-3.8-flash-minimal": "gemini-3-flash",
+  "gemini-3.8-flash-low": "gemini-3-flash",
+  "gemini-3.8-flash-medium": "gemini-3-flash",
+  "gemini-3.8-flash-high": "gemini-3-flash",
 
   // Claude proxy names (gemini- prefix for compatibility)
   "gemini-claude-opus-4-6-thinking-low": "claude-opus-4-6-thinking",
