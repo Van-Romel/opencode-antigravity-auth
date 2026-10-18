@@ -63,71 +63,134 @@ You can use any of the following methods without altering your workflow:
 
 ---
 
-## Installation
+## Installation & Setup for OpenCode v2
 
-<details open>
-<summary><b>For Humans</b></summary>
+> [!IMPORTANT]
+> **OpenCode v2 Notice**:
+> In OpenCode v2 (`2.0.x+`), third-party plugins no longer inject options into the interactive `opencode auth login` terminal menu.
+> **Do not use `opencode auth login` to authenticate with Antigravity.**
+> Instead, authenticate using the integrated **`auth-cli`** or environment variables as explained in Step 2 below.
 
-**Option A: Let an LLM do it**
+### Step 1: Install the Plugin in OpenCode v2
 
-Paste this into any LLM agent (Claude Code, OpenCode, Cursor, etc.):
+OpenCode v2 automatically discovers and hot-reloads plugins placed inside `~/.config/opencode/plugins/`.
 
-```
-Install the opencode-antigravity-auth plugin and add the Antigravity model definitions to ~/.config/opencode/opencode.json by following: https://raw.githubusercontent.com/NoeFabris/opencode-antigravity-auth/dev/README.md
-```
+Copy `plugins/antigravity.js` into your OpenCode plugins folder:
 
-**Option B: Manual setup**
+- **Windows**:
+  ```powershell
+  Copy-Item plugins/antigravity.js $env:USERPROFILE\.config\opencode\plugins\ -Force
+  ```
+- **macOS / Linux**:
+  ```bash
+  mkdir -p ~/.config/opencode/plugins
+  cp plugins/antigravity.js ~/.config/opencode/plugins/
+  ```
 
-1. **Add the plugin** to `~/.config/opencode/opencode.json`:
+*(Alternatively, if installing via git/npm dependency in `~/.config/opencode/package.json`: `npm install github:Van-Romel/opencode-antigravity-auth`)*
 
-   ```json
-   {
-     "plugin": ["opencode-antigravity-auth@latest"]
-   }
-   ```
+---
 
-   > Want bleeding-edge features? Use `opencode-antigravity-auth@beta` instead.
+### Step 2: Authenticate (Choose One Method)
 
-2. **Login** with your Google account:
-
-   ```bash
-   opencode auth login
-   ```
-
-3. **Add models** — choose one:
-   - Run `opencode auth login` → Google → OAuth with Google (Antigravity) → select **"Configure models in opencode.json"** (auto-configures all models)
-   - Or manually copy the [full configuration](#models) below
-
-4. **Use it:**
-
-   ```bash
-   opencode run "Hello" --model=google/antigravity-claude-opus-4-6-thinking --variant=max
-   ```
-
-</details>
-
-<details>
-<summary><b>For LLM Agents</b></summary>
-
-### Step-by-Step Instructions
-
-1. Edit the OpenCode configuration file at `~/.config/opencode/opencode.json`
-   
-   > **Note**: This path works on all platforms. On Windows, `~` resolves to your user home directory (e.g., `C:\Users\YourName`).
-
-2. Add the plugin to the `plugin` array
-
-3. Add the model definitions from the [Full models configuration](#models) section
-
-4. Set `provider` to `"google"` and choose a model
-
-### Verification
-
+#### Method A: Integrated Browser OAuth (Recommended)
+Run the standalone authentication tool:
 ```bash
-opencode run "Hello" --model=google/antigravity-claude-opus-4-6-thinking --variant=max
+node bin/auth-cli.mjs login
+```
+1. It automatically starts a temporary local callback server on `http://localhost:51121/oauth-callback`.
+2. Opens your default web browser to Google's official OAuth consent screen.
+3. Once authorized, it retrieves your OAuth refresh token and saves it securely to `~/.config/opencode/antigravity-accounts.json`.
+4. OpenCode v2 picks it up immediately without restarting.
+
+To inspect active accounts and remaining quota:
+```bash
+node bin/auth-cli.mjs list
 ```
 
-</details>
+#### Method B: Environment Variables (Headless / Automated)
+If you prefer managing credentials via environment variables:
+```bash
+# OAuth refresh token (for Claude Opus/Sonnet and Gemini 3 Pro/Flash):
+export ANTIGRAVITY_REFRESH_TOKEN="your_refresh_token"
+
+# Or Google Gemini AI Studio API Key (optional):
+export GEMINI_API_KEY="your_api_key"
+```
+
+---
+
+### Step 3: Add Model Definitions to `opencode.json`
+
+Add the model definitions to your `~/.config/opencode/opencode.json` (do not add a `"plugin"` array when using `plugins/antigravity.js`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "google": {
+      "models": {
+        "antigravity-gemini-3-pro": {
+          "name": "Gemini 3 Pro (Antigravity)",
+          "limit": { "context": 1048576, "output": 65535 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+          "variants": {
+            "low": { "thinkingLevel": "low" },
+            "high": { "thinkingLevel": "high" }
+          }
+        },
+        "antigravity-gemini-3.1-pro": {
+          "name": "Gemini 3.1 Pro (Antigravity)",
+          "limit": { "context": 1048576, "output": 65535 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+          "variants": {
+            "low": { "thinkingLevel": "low" },
+            "high": { "thinkingLevel": "high" }
+          }
+        },
+        "antigravity-gemini-3-flash": {
+          "name": "Gemini 3 Flash (Antigravity)",
+          "limit": { "context": 1048576, "output": 65536 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+          "variants": {
+            "minimal": { "thinkingLevel": "minimal" },
+            "low": { "thinkingLevel": "low" },
+            "medium": { "thinkingLevel": "medium" },
+            "high": { "thinkingLevel": "high" }
+          }
+        },
+        "antigravity-claude-sonnet-4-6": {
+          "name": "Claude Sonnet 4.6 (Antigravity)",
+          "limit": { "context": 200000, "output": 64000 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] }
+        },
+        "antigravity-claude-opus-4-6-thinking": {
+          "name": "Claude Opus 4.6 Thinking (Antigravity)",
+          "limit": { "context": 200000, "output": 64000 },
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+          "variants": {
+            "low": { "thinkingConfig": { "thinkingBudget": 8192 } },
+            "max": { "thinkingConfig": { "thinkingBudget": 32768 } }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### Step 4: Run Models in OpenCode
+
+Use the models directly in your OpenCode sessions:
+```bash
+# Chat with Gemini 3.1 Pro:
+opencode run "Hello" --model=google/antigravity-gemini-3.1-pro
+
+# Code with Claude Opus 4.6 Thinking:
+opencode run "Explain microservices architecture" --model=google/antigravity-claude-opus-4-6-thinking --variant=max
+```
 
 ---
 
@@ -178,7 +241,6 @@ Add this to your `~/.config/opencode/opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-antigravity-auth@latest"],
   "provider": {
     "google": {
       "models": {
