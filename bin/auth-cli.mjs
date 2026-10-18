@@ -62,59 +62,148 @@ function openBrowser(url) {
   } catch {}
 }
 
-async function loginFlow() {
+async function loginFlow(requestedCount = 1) {
+  const count = Math.max(1, requestedCount);
   console.log("\n========================================================");
-  console.log("  Google Antigravity OAuth - OpenCode Multi-Account");
+  console.log(`  Google Antigravity OAuth - OpenCode Multi-Account (${count} conta${count > 1 ? "s" : ""})`);
   console.log("========================================================\n");
-
-  const pkce = generatePKCE();
-  const state = base64url(Buffer.from(JSON.stringify({ verifier: pkce.verifier })));
 
   // Tenta as portas candidatas em ordem (evitando ranges bloqueados por Hyper-V/WSL no Windows)
   const candidatePorts = [51121, 45121, 35121, 18082, 0];
   let server;
   let activePort;
 
-  let resolveCode, rejectCode;
-  const codePromise = new Promise((resolve, reject) => {
-    resolveCode = resolve;
-    rejectCode = reject;
+  const sessions = new Map(); // state -> { id, pkce, done }
+  let completedCount = 0;
+
+  let resolveAll, rejectAll;
+  const allDonePromise = new Promise((resolve, reject) => {
+    resolveAll = resolve;
+    rejectAll = reject;
   });
 
-  const requestHandler = (req, res) => {
+  const requestHandler = async (req, res) => {
     try {
       const reqUrl = new URL(req.url, `http://localhost:${activePort}`);
       if (reqUrl.pathname === "/oauth-callback") {
         const code = reqUrl.searchParams.get("code");
         const error = reqUrl.searchParams.get("error");
+        const state = reqUrl.searchParams.get("state");
 
         if (error) {
           res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
           res.end(`<h2>Erro na autenticação: ${error}</h2>`);
-          rejectCode(new Error(error));
-          server.close();
           return;
         }
 
-        if (code) {
+        const session = sessions.get(state);
+        if (!session) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<h2>Sessão inválida ou expirada.</h2>`);
+          return;
+        }
+
+        if (session.done) {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<h2>Esta conta já foi autenticada com sucesso!</h2>`);
+          return;
+        }
+
+        // Trocando por tokens com o Google
+        try {
+          const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              client_id: CLIENT_ID,
+              client_secret: CLIENT_SECRET,
+              code,
+              grant_type: "authorization_code",
+              redirect_uri: `http://localhost:${activePort}/oauth-callback`,
+              code_verifier: session.pkce.verifier,
+            }),
+          });
+
+          if (!tokenRes.ok) {
+            const errText = await tokenRes.text();
+            throw new Error(`Falha ao obter tokens: ${tokenRes.status} ${errText}`);
+          }
+
+          const tokenData = await tokenRes.json();
+          const refreshToken = tokenData.refresh_token;
+
+          if (!refreshToken) {
+            throw new Error("O Google não retornou refresh_token. Remova o acesso do app na sua Conta Google e tente novamente.");
+          }
+
+          let email = `conta-${session.id}`;
+          try {
+            const userRes = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
+              headers: { Authorization: `Bearer ${tokenData.access_token}` },
+            });
+            if (userRes.ok) {
+              const u = await userRes.json();
+              if (u.email) email = u.email;
+            }
+          } catch {}
+
+          const storage = loadAccounts();
+          const existingIdx = storage.accounts.findIndex(a => a.email === email || a.refreshToken === refreshToken);
+
+          const accountObj = {
+            email,
+            refreshToken,
+            projectId: "rising-fact-p41fc",
+            addedAt: Date.now(),
+            lastUsed: Date.now(),
+            quota: {
+              claude: { remainingFraction: 1.0, resetTime: null },
+              gemini: { remainingFraction: 1.0, resetTime: null }
+            }
+          };
+
+          if (existingIdx >= 0) {
+            storage.accounts[existingIdx] = accountObj;
+            console.log(`\n✓ [Conta ${session.id}/${count}] Atualizada com sucesso: ${email}`);
+          } else {
+            storage.accounts.push(accountObj);
+            console.log(`\n✓ [Conta ${session.id}/${count}] Adicionada com sucesso: ${email} (Total cadastradas: ${storage.accounts.length})`);
+          }
+
+          saveAccounts(storage);
+          session.done = true;
+          completedCount++;
+
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
           res.end(`
             <html>
               <body style="font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc;">
-                <h1 style="color: #4ade80;">Autenticação Concluída com Sucesso!</h1>
-                <p>Você pode fechar esta aba e retornar ao OpenCode / Terminal.</p>
+                <h1 style="color: #4ade80;">Autenticação da Conta ${session.id} Concluída!</h1>
+                <p>E-mail: <strong>${email}</strong></p>
+                <p>Você pode fechar esta aba e retornar ao Terminal.</p>
               </body>
             </html>
           `);
-          resolveCode(code);
-          setTimeout(() => server.close(), 1000);
-          return;
+
+          if (completedCount >= count) {
+            console.log(`\n✓ Todas as ${count} contas foram autenticadas com sucesso!`);
+            console.log(`Configuração salva em: ${CONFIG_PATH}\n`);
+            setTimeout(() => {
+              server.close();
+              resolveAll();
+            }, 1000);
+          }
+        } catch (authErr) {
+          console.error(`Erro ao autenticar Conta ${session.id}:`, authErr.message);
+          res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<h2>Erro: ${authErr.message}</h2>`);
         }
+        return;
       }
       res.writeHead(404);
       res.end("Not found");
     } catch (err) {
-      rejectCode(err);
+      rejectAll(err);
     }
   };
 
@@ -128,9 +217,7 @@ async function loginFlow() {
       server = candidate;
       activePort = server.address().port;
       break;
-    } catch (err) {
-      // Porta ocupada ou restrita pelo SO (ex: WinNAT/Hyper-V EACCES), tenta a próxima porta candidata
-    }
+    } catch (err) {}
   }
 
   if (!server) {
@@ -138,95 +225,49 @@ async function loginFlow() {
   }
 
   const redirectUri = `http://localhost:${activePort}/oauth-callback`;
-  console.log(`Servidor local de callback ativo em http://127.0.0.1:${activePort}/oauth-callback`);
+  console.log(`Servidor local de callback ativo em http://127.0.0.1:${activePort}/oauth-callback\n`);
 
-  const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-  authUrl.searchParams.set("client_id", CLIENT_ID);
-  authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("redirect_uri", redirectUri);
-  authUrl.searchParams.set("scope", SCOPES.join(" "));
-  authUrl.searchParams.set("code_challenge", pkce.challenge);
-  authUrl.searchParams.set("code_challenge_method", "S256");
-  authUrl.searchParams.set("state", state);
-  authUrl.searchParams.set("access_type", "offline");
-  authUrl.searchParams.set("prompt", "consent");
+  for (let i = 1; i <= count; i++) {
+    const pkce = generatePKCE();
+    const state = base64url(Buffer.from(JSON.stringify({ verifier: pkce.verifier, id: i })));
+    sessions.set(state, { id: i, pkce, done: false });
 
-  console.log("Abrindo navegador para autenticação...");
-  openBrowser(authUrl.toString());
-  console.log("\nCaso não abra automaticamente, copie e cole este link:");
-  console.log(authUrl.toString() + "\n");
+    const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    authUrl.searchParams.set("client_id", CLIENT_ID);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("scope", SCOPES.join(" "));
+    authUrl.searchParams.set("code_challenge", pkce.challenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("access_type", "offline");
+    authUrl.searchParams.set("prompt", "consent");
+
+    if (count === 1) {
+      console.log("Abrindo navegador para autenticação...");
+      openBrowser(authUrl.toString());
+      console.log("\nCaso não abra automaticamente, copie e cole este link:");
+      console.log(authUrl.toString() + "\n");
+    } else {
+      console.log("================================================================================");
+      console.log(`🔗 [CONTA ${i}/${count}] - Abra no perfil/navegador onde a CONTA ${i} está logada:`);
+      console.log(authUrl.toString());
+      console.log("================================================================================\n");
+    }
+  }
+
+  if (count > 1) {
+    console.log("👉 Dica: Copie cada link acima e abra na respectiva janela/perfil de cada conta Google.");
+    console.log("Aguardando as autorizações no navegador...\n");
+  }
 
   const timeoutTimer = setTimeout(() => {
     server.close();
-    rejectCode(new Error("Timeout aguardando callback OAuth (5 minutos)."));
+    rejectAll(new Error("Timeout aguardando callback OAuth (5 minutos)."));
   }, 300000);
 
-  const code = await codePromise;
+  await allDonePromise;
   clearTimeout(timeoutTimer);
-  console.log("Código recebido! Trocando por tokens com o Google...");
-
-  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      code,
-      grant_type: "authorization_code",
-      redirect_uri: redirectUri,
-      code_verifier: pkce.verifier,
-    }),
-  });
-
-  if (!tokenRes.ok) {
-    const errText = await tokenRes.text();
-    throw new Error(`Falha ao obter tokens: ${tokenRes.status} ${errText}`);
-  }
-
-  const tokenData = await tokenRes.json();
-  const refreshToken = tokenData.refresh_token;
-
-  if (!refreshToken) {
-    throw new Error("O Google não retornou um refresh_token. Remova o acesso do app na sua Conta Google e tente novamente.");
-  }
-
-  // Obter e-mail
-  let email = "conta-antigravity";
-  try {
-    const userRes = await fetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` },
-    });
-    if (userRes.ok) {
-      const u = await userRes.json();
-      if (u.email) email = u.email;
-    }
-  } catch {}
-
-  const storage = loadAccounts();
-  const existingIdx = storage.accounts.findIndex(a => a.email === email || a.refreshToken === refreshToken);
-
-  const accountObj = {
-    email,
-    refreshToken,
-    projectId: "rising-fact-p41fc",
-    addedAt: Date.now(),
-    lastUsed: Date.now(),
-    quota: {
-      claude: { remainingFraction: 1.0, resetTime: null },
-      gemini: { remainingFraction: 1.0, resetTime: null }
-    }
-  };
-
-  if (existingIdx >= 0) {
-    storage.accounts[existingIdx] = accountObj;
-    console.log(`\n✓ Conta atualizada com sucesso: ${email}`);
-  } else {
-    storage.accounts.push(accountObj);
-    console.log(`\n✓ Nova conta adicionada com sucesso: ${email} (Total de contas: ${storage.accounts.length})`);
-  }
-
-  saveAccounts(storage);
-  console.log(`Contas salvas em: ${CONFIG_PATH}\n`);
 }
 
 function listAccounts() {
@@ -258,8 +299,10 @@ function listAccounts() {
 }
 
 const cmd = process.argv[2] || "list";
+const countArg = parseInt(process.argv[3], 10) || (process.argv.includes("--count") ? parseInt(process.argv[process.argv.indexOf("--count") + 1], 10) : 1) || 1;
+
 if (cmd === "login" || cmd === "add") {
-  loginFlow().catch(err => {
+  loginFlow(countArg).catch(err => {
     console.error("Erro durante autenticação:", err.message);
     process.exit(1);
   });
