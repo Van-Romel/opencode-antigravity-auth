@@ -3,8 +3,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 
-const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const CLIENT_SECRET = "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";
+// Public Google Cloud Code / Antigravity Desktop OAuth Client credentials issued by Google LLC.
+// NOTE: This is NOT a personal API key, user token, or private secret. It is Google's official public
+// client identifier used by VS Code / IDE tools to initiate the standard OAuth 2.0 PKCE consent screen.
+const CLIENT_ID = process.env.ANTIGRAVITY_CLIENT_ID || "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const CLIENT_SECRET = process.env.ANTIGRAVITY_CLIENT_SECRET || "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";
 const CONFIG_PATH = join(homedir(), ".config/opencode/antigravity-accounts.json");
 const SETTINGS_PATH = join(homedir(), ".config/opencode/antigravity.json");
 
