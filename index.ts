@@ -1,7 +1,11 @@
+import { AntigravityCLIOAuthPlugin, GoogleOAuthPlugin } from "./src/plugin";
+
 export {
   AntigravityCLIOAuthPlugin,
   GoogleOAuthPlugin,
-} from "./src/plugin";
+};
+
+export default AntigravityCLIOAuthPlugin;
 
 export {
   authorizeAntigravity,
