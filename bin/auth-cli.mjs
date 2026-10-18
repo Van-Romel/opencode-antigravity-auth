@@ -49,6 +49,19 @@ function saveAccounts(data) {
   writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2), "utf-8");
 }
 
+function openBrowser(url) {
+  const platform = process.platform;
+  try {
+    if (platform === "win32") {
+      exec(`powershell -NoProfile -Command "Start-Process '${url.replace(/'/g, "''")}'"`);
+    } else if (platform === "darwin") {
+      exec(`open "${url}"`);
+    } else {
+      exec(`xdg-open "${url}"`);
+    }
+  } catch {}
+}
+
 async function loginFlow() {
   console.log("\n========================================================");
   console.log("  Google Antigravity OAuth - OpenCode Multi-Account");
@@ -57,10 +70,80 @@ async function loginFlow() {
   const pkce = generatePKCE();
   const state = base64url(Buffer.from(JSON.stringify({ verifier: pkce.verifier })));
 
+  // Tenta as portas candidatas em ordem (evitando ranges bloqueados por Hyper-V/WSL no Windows)
+  const candidatePorts = [51121, 45121, 35121, 18082, 0];
+  let server;
+  let activePort;
+
+  let resolveCode, rejectCode;
+  const codePromise = new Promise((resolve, reject) => {
+    resolveCode = resolve;
+    rejectCode = reject;
+  });
+
+  const requestHandler = (req, res) => {
+    try {
+      const reqUrl = new URL(req.url, `http://localhost:${activePort}`);
+      if (reqUrl.pathname === "/oauth-callback") {
+        const code = reqUrl.searchParams.get("code");
+        const error = reqUrl.searchParams.get("error");
+
+        if (error) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<h2>Erro na autenticação: ${error}</h2>`);
+          rejectCode(new Error(error));
+          server.close();
+          return;
+        }
+
+        if (code) {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`
+            <html>
+              <body style="font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc;">
+                <h1 style="color: #4ade80;">Autenticação Concluída com Sucesso!</h1>
+                <p>Você pode fechar esta aba e retornar ao OpenCode / Terminal.</p>
+              </body>
+            </html>
+          `);
+          resolveCode(code);
+          setTimeout(() => server.close(), 1000);
+          return;
+        }
+      }
+      res.writeHead(404);
+      res.end("Not found");
+    } catch (err) {
+      rejectCode(err);
+    }
+  };
+
+  for (const port of candidatePorts) {
+    try {
+      const candidate = createServer(requestHandler);
+      await new Promise((resolve, reject) => {
+        candidate.once("error", reject);
+        candidate.listen(port, "127.0.0.1", () => resolve());
+      });
+      server = candidate;
+      activePort = server.address().port;
+      break;
+    } catch (err) {
+      // Porta ocupada ou restrita pelo SO (ex: WinNAT/Hyper-V EACCES), tenta a próxima porta candidata
+    }
+  }
+
+  if (!server) {
+    throw new Error("Não foi possível iniciar o servidor local de callback OAuth em nenhuma porta.");
+  }
+
+  const redirectUri = `http://localhost:${activePort}/oauth-callback`;
+  console.log(`Servidor local de callback ativo em http://127.0.0.1:${activePort}/oauth-callback`);
+
   const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   authUrl.searchParams.set("client_id", CLIENT_ID);
   authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("redirect_uri", REDIRECT_URI);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
   authUrl.searchParams.set("scope", SCOPES.join(" "));
   authUrl.searchParams.set("code_challenge", pkce.challenge);
   authUrl.searchParams.set("code_challenge_method", "S256");
@@ -68,60 +151,18 @@ async function loginFlow() {
   authUrl.searchParams.set("access_type", "offline");
   authUrl.searchParams.set("prompt", "consent");
 
-  console.log("Iniciando servidor local na porta 51121 para receber o callback...");
+  console.log("Abrindo navegador para autenticação...");
+  openBrowser(authUrl.toString());
+  console.log("\nCaso não abra automaticamente, copie e cole este link:");
+  console.log(authUrl.toString() + "\n");
 
-  const codePromise = new Promise((resolve, reject) => {
-    const server = createServer((req, res) => {
-      try {
-        const reqUrl = new URL(req.url, "http://localhost:51121");
-        if (reqUrl.pathname === "/oauth-callback") {
-          const code = reqUrl.searchParams.get("code");
-          const error = reqUrl.searchParams.get("error");
-
-          if (error) {
-            res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-            res.end(`<h2>Erro na autenticação: ${error}</h2>`);
-            reject(new Error(error));
-            server.close();
-            return;
-          }
-
-          if (code) {
-            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-            res.end(`
-              <html>
-                <body style="font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc;">
-                  <h1 style="color: #4ade80;">Autenticação Concluída com Sucesso!</h1>
-                  <p>Você pode fechar esta aba e retornar ao OpenCode / Terminal.</p>
-                </body>
-              </html>
-            `);
-            resolve(code);
-            setTimeout(() => server.close(), 1000);
-            return;
-          }
-        }
-        res.writeHead(404);
-        res.end("Not found");
-      } catch (err) {
-        reject(err);
-      }
-    });
-
-    server.listen(51121, () => {
-      console.log("Abrindo navegador para autenticação...");
-      exec(`start "" "${authUrl.toString()}"`);
-      console.log("\nCaso não abra automaticamente, copie e cole este link:");
-      console.log(authUrl.toString() + "\n");
-    });
-
-    setTimeout(() => {
-      server.close();
-      reject(new Error("Timeout aguardando callback OAuth (5 minutos)."));
-    }, 300000);
-  });
+  const timeoutTimer = setTimeout(() => {
+    server.close();
+    rejectCode(new Error("Timeout aguardando callback OAuth (5 minutos)."));
+  }, 300000);
 
   const code = await codePromise;
+  clearTimeout(timeoutTimer);
   console.log("Código recebido! Trocando por tokens com o Google...");
 
   const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
@@ -132,7 +173,7 @@ async function loginFlow() {
       client_secret: CLIENT_SECRET,
       code,
       grant_type: "authorization_code",
-      redirect_uri: REDIRECT_URI,
+      redirect_uri: redirectUri,
       code_verifier: pkce.verifier,
     }),
   });
