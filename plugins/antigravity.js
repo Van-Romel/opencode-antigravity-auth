@@ -258,135 +258,209 @@ function formatCountdown(ms) {
   return `${minutes}min`;
 }
 
+function resolveModel(rawModel) {
+  let model = rawModel || "gemini-3-flash";
+  if (model.startsWith("antigravity-")) {
+    model = model.replace("antigravity-", "");
+  }
+  if (model.startsWith("gemini-3.8-flash")) {
+    model = "gemini-3-flash";
+  }
+  return model;
+}
+
+function createAntigravityTransformStream() {
+  let buffer = "";
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data:")) {
+          controller.enqueue(encoder.encode(line + "\n"));
+          continue;
+        }
+        const json = line.slice(5).trim();
+        if (!json) {
+          controller.enqueue(encoder.encode(line + "\n"));
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(json);
+          if (parsed && parsed.response !== undefined) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n`));
+          } else {
+            controller.enqueue(encoder.encode(line + "\n"));
+          }
+        } catch {
+          controller.enqueue(encoder.encode(line + "\n"));
+        }
+      }
+    },
+    flush(controller) {
+      if (buffer) {
+        if (buffer.startsWith("data:")) {
+          const json = buffer.slice(5).trim();
+          try {
+            const parsed = JSON.parse(json);
+            if (parsed && parsed.response !== undefined) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n`));
+              return;
+            }
+          } catch {}
+        }
+        controller.enqueue(encoder.encode(buffer));
+      }
+    }
+  });
+}
+
 export default {
   id: "antigravity",
   async setup(ctx) {
     console.log("[Antigravity] Plugin OpenCode v2 inicializado com SQP (Strict Quota Protocol 80%).");
 
-    await ctx.session.hook("http.request", async (event) => {
-      const url = event.request?.url || "";
-      const isGoogleRequest = event.providerID === "google" || url.includes("googleapis.com");
+    const originalFetch = globalThis.fetch;
 
-      if (!isGoogleRequest) {
-        return;
-      }
+    globalThis.fetch = async function (input, init) {
+      const url = typeof input === "string" ? input : (input?.url || "");
 
-      const settings = loadSettings();
-      const thresholdPercent = settings.soft_quota_threshold_percent || DEFAULT_THRESHOLD_PERCENT;
-      const minRemainingFraction = (100 - thresholdPercent) / 100; // 80% de uso -> 0.20 restante
+      if (url.includes("generativelanguage.googleapis.com")) {
+        const match = url.match(/\/models\/([^:]+):(\w+)/);
+        if (match) {
+          const [, rawModel, rawAction] = match;
+          const actualModel = resolveModel(rawModel);
+          const isStreaming = rawAction === "streamGenerateContent" || url.includes("alt=sse");
 
-      const storage = loadAccounts();
-      const accounts = storage.accounts || [];
+          const settings = loadSettings();
+          const thresholdPercent = settings.soft_quota_threshold_percent || DEFAULT_THRESHOLD_PERCENT;
+          const minRemainingFraction = (100 - thresholdPercent) / 100;
 
-      if (accounts.length === 0) {
-        return;
-      }
+          const storage = loadAccounts();
+          const accounts = storage.accounts || [];
 
-      let selectedIndex = storage.activeIndex || 0;
-      if (selectedIndex >= accounts.length) selectedIndex = 0;
+          if (accounts.length > 0) {
+            let selectedIndex = storage.activeIndex || 0;
+            if (selectedIndex >= accounts.length) selectedIndex = 0;
 
-      let selectedAccount = accounts[selectedIndex];
-      let accessToken = null;
+            let selectedAccount = accounts[selectedIndex];
+            let accessToken = null;
 
-      try {
-        accessToken = await getValidAccessToken(selectedAccount, selectedIndex);
-      } catch (err) {
-        console.warn(`[Antigravity] Falha na conta ${selectedIndex + 1}, alternando: ${err.message}`);
-        if (accounts.length > 1) {
-          selectedIndex = (selectedIndex + 1) % accounts.length;
-          selectedAccount = accounts[selectedIndex];
-          accessToken = await getValidAccessToken(selectedAccount, selectedIndex);
-        } else {
-          throw err;
-        }
-      }
+            try {
+              accessToken = await getValidAccessToken(selectedAccount, selectedIndex);
+            } catch (err) {
+              if (accounts.length > 1) {
+                selectedIndex = (selectedIndex + 1) % accounts.length;
+                selectedAccount = accounts[selectedIndex];
+                accessToken = await getValidAccessToken(selectedAccount, selectedIndex);
+              } else {
+                throw err;
+              }
+            }
 
-      let quota = await fetchAccountQuota(selectedAccount, selectedIndex, accessToken);
+            let quota = await fetchAccountQuota(selectedAccount, selectedIndex, accessToken);
 
-      // Se a conta selecionada ultrapassou o limite de 80% (restante <= 20%)
-      if (quota.remainingFraction <= minRemainingFraction) {
-        console.warn(`[Antigravity] Conta ${selectedIndex + 1} (${selectedAccount.email || "ativa"}) atingiu ${Math.round((1 - quota.remainingFraction) * 100)}% de cota (limite seguro: ${thresholdPercent}%).`);
+            if (quota.remainingFraction <= minRemainingFraction) {
+              if (accounts.length > 1) {
+                const alternateIndex = (selectedIndex + 1) % accounts.length;
+                const alternateAccount = accounts[alternateIndex];
+                const alternateToken = await getValidAccessToken(alternateAccount, alternateIndex);
+                const alternateQuota = await fetchAccountQuota(alternateAccount, alternateIndex, alternateToken);
 
-        if (accounts.length > 1) {
-          const alternateIndex = (selectedIndex + 1) % accounts.length;
-          const alternateAccount = accounts[alternateIndex];
-          const alternateToken = await getValidAccessToken(alternateAccount, alternateIndex);
-          const alternateQuota = await fetchAccountQuota(alternateAccount, alternateIndex, alternateToken);
+                if (alternateQuota.remainingFraction > minRemainingFraction) {
+                  selectedIndex = alternateIndex;
+                  selectedAccount = alternateAccount;
+                  accessToken = alternateToken;
+                  quota = alternateQuota;
+                  storage.activeIndex = alternateIndex;
+                  saveAccounts(storage);
+                } else {
+                  const reset1 = quota.resetTime ? Date.parse(quota.resetTime) : Date.now() + (5 * 3600 * 1000);
+                  const reset2 = alternateQuota.resetTime ? Date.parse(alternateQuota.resetTime) : Date.now() + (5 * 3600 * 1000);
+                  const waitMs = Math.max(0, Math.min(reset1, reset2) - Date.now());
+                  throw new Error(`[Antigravity Quota Protection] Ambas as contas atingiram 80% de consumo. Reset em ${formatCountdown(waitMs)}.`);
+                }
+              }
+            }
 
-          if (alternateQuota.remainingFraction > minRemainingFraction) {
-            console.log(`[Antigravity] Rotacionando automaticamente para a Conta ${alternateIndex + 1} (${alternateAccount.email || "secundária"}) com ${Math.round(alternateQuota.remainingFraction * 100)}% de cota disponível.`);
-            selectedIndex = alternateIndex;
-            selectedAccount = alternateAccount;
-            accessToken = alternateToken;
-            quota = alternateQuota;
-            storage.activeIndex = alternateIndex;
-            saveAccounts(storage);
-          } else {
-            // AMBAS AS CONTAS ATINGIRAM 80%: Bloqueio local para evitar shadow ban e erro 429
-            const reset1 = quota.resetTime ? Date.parse(quota.resetTime) : Date.now() + (5 * 3600 * 1000);
-            const reset2 = alternateQuota.resetTime ? Date.parse(alternateQuota.resetTime) : Date.now() + (5 * 3600 * 1000);
-            const earliestReset = Math.min(reset1, reset2);
-            const waitMs = Math.max(0, earliestReset - Date.now());
-            const countdown = formatCountdown(waitMs);
+            const targetEndpoint = `https://cloudcode-pa.googleapis.com/v1internal:${rawAction}${isStreaming ? "?alt=sse" : ""}`;
 
-            const lockMessage = `[Antigravity Quota Protection] Ambas as contas atingiram o limite seguro de ${thresholdPercent}% de consumo (restante <= ${Math.round(minRemainingFraction * 100)}%). ` +
-              `As requisições foram bloqueadas localmente para evitar erro 429 e proteger suas contas contra shadow ban. ` +
-              `A cota mais próxima de uma das contas será restabelecida em aproximadamente ${countdown}.`;
+            let originalBody = {};
+            if (typeof init?.body === "string" && init.body) {
+              try { originalBody = JSON.parse(init.body); } catch {}
+            }
 
-            console.error("\n========================================================");
-            console.error(lockMessage);
-            console.error("========================================================\n");
-            throw new Error(lockMessage);
+            const wrappedBody = {
+              project: selectedAccount.projectId || DEFAULT_PROJECT_ID,
+              model: actualModel,
+              request: originalBody
+            };
+
+            const headers = new Headers(init?.headers || {});
+            if (accessToken) {
+              headers.set("Authorization", `Bearer ${accessToken}`);
+            } else if (selectedAccount.apiKey) {
+              headers.set("x-goog-api-key", selectedAccount.apiKey);
+            }
+            headers.set("Content-Type", "application/json");
+            headers.set("User-Agent", PLATFORM_HEADERS["User-Agent"]);
+            headers.set("X-Goog-Api-Client", PLATFORM_HEADERS["X-Goog-Api-Client"]);
+            headers.set("Client-Metadata", PLATFORM_HEADERS["Client-Metadata"]);
+            headers.delete("x-goog-user-project");
+            headers.delete("x-api-key");
+            headers.delete("x-goog-api-key");
+
+            const res = await originalFetch(targetEndpoint, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(wrappedBody),
+              signal: init?.signal
+            });
+
+            if (!res.ok) {
+              return res;
+            }
+
+            if (isStreaming && res.body) {
+              const transformStream = createAntigravityTransformStream();
+              const transformedBody = res.body.pipeThrough(transformStream);
+              return new Response(transformedBody, {
+                status: res.status,
+                statusText: res.statusText,
+                headers: res.headers
+              });
+            } else {
+              const text = await res.text();
+              try {
+                const parsed = JSON.parse(text);
+                if (parsed && parsed.response !== undefined) {
+                  return new Response(JSON.stringify(parsed.response), {
+                    status: res.status,
+                    statusText: res.statusText,
+                    headers: res.headers
+                  });
+                }
+              } catch {}
+              return new Response(text, {
+                status: res.status,
+                statusText: res.statusText,
+                headers: res.headers
+              });
+            }
           }
-        } else {
-          const reset = quota.resetTime ? Date.parse(quota.resetTime) : Date.now() + (5 * 3600 * 1000);
-          const waitMs = Math.max(0, reset - Date.now());
-          const countdown = formatCountdown(waitMs);
-
-          const lockMessage = `[Antigravity Quota Protection] A sua conta atingiu o limite de segurança de ${thresholdPercent}% de cota. ` +
-            `Requisição bloqueada preventivamente contra shadow ban. Liberação em aproximadamente ${countdown}.`;
-          console.error(lockMessage);
-          throw new Error(lockMessage);
         }
       }
 
-      // Autenticação conforme tipo de conta
-      if (selectedAccount.apiKey) {
-        event.request.headers.set("x-goog-api-key", selectedAccount.apiKey);
-      } else if (accessToken) {
-        event.request.headers.set("Authorization", `Bearer ${accessToken}`);
-      }
-
-      // Headers oficiais alinhados com a plataforma do host
-      event.request.headers.set("User-Agent", PLATFORM_HEADERS["User-Agent"]);
-      event.request.headers.set("X-Goog-Api-Client", PLATFORM_HEADERS["X-Goog-Api-Client"]);
-      event.request.headers.set("Client-Metadata", PLATFORM_HEADERS["Client-Metadata"]);
-
-      selectedAccount.lastUsed = Date.now();
-      saveAccounts(storage);
-    });
-
-    await ctx.session.hook("http.response", async (event) => {
-      const status = event.response?.status;
-      if (status === 429) {
-        console.warn("[Antigravity] 429 Rate Limit detectado na resposta do Google! Marcando conta como temporariamente esgotada.");
-        const storage = loadAccounts();
-        const activeIdx = storage.activeIndex || 0;
-        if (storage.accounts && storage.accounts[activeIdx]) {
-          quotaCache.set(activeIdx, {
-            timestamp: Date.now(),
-            quota: { remainingFraction: 0, resetTime: new Date(Date.now() + (5 * 3600 * 1000)).toISOString() }
-          });
-          if (storage.accounts.length > 1) {
-            storage.activeIndex = (activeIdx + 1) % storage.accounts.length;
-            saveAccounts(storage);
-            console.log(`[Antigravity] Rotacionado automaticamente para conta ${storage.activeIndex + 1} após 429.`);
-          }
-        }
-      }
-    });
+      return originalFetch.apply(this, arguments);
+    };
 
     return () => {
+      globalThis.fetch = originalFetch;
       console.log("[Antigravity] Plugin finalizado/descarregado.");
     };
   }
