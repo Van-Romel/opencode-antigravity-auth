@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -10,6 +11,7 @@ const CLIENT_ID = process.env.ANTIGRAVITY_CLIENT_ID || "1071006060591-tmhssin2h2
 const CLIENT_SECRET = process.env.ANTIGRAVITY_CLIENT_SECRET || "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";
 const CONFIG_PATH = join(homedir(), ".config/opencode/antigravity-accounts.json");
 const SETTINGS_PATH = join(homedir(), ".config/opencode/antigravity.json");
+const PROXY_PORT = 45122;
 
 // Limite de segurança de cota (80% de uso -> <= 20% restante)
 const DEFAULT_THRESHOLD_PERCENT = 80;
@@ -139,7 +141,7 @@ function saveAccounts(data) {
 
 async function getValidAccessToken(account, index) {
   if (account.apiKey) {
-    return null; // Contas por API Key não necessitam de Bearer token
+    return null;
   }
 
   const cached = tokenCache.get(index);
@@ -220,22 +222,9 @@ async function fetchAccountQuota(account, index, accessToken) {
       quotaCache.set(index, { timestamp: now, quota: quotaResult });
       return quotaResult;
     }
-  } catch (e) {
-    // Falha transitória não bloqueia
-  }
+  } catch (e) {}
 
   return cached ? cached.quota : { remainingFraction: 1.0, resetTime: null };
-}
-
-function formatCountdown(ms) {
-  if (ms <= 0) return "agora";
-  const totalSeconds = Math.ceil(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  if (hours > 0) {
-    return `${hours}h ${minutes}min`;
-  }
-  return `${minutes}min`;
 }
 
 function resolveModel(rawModel) {
@@ -249,206 +238,150 @@ function resolveModel(rawModel) {
   return model;
 }
 
-function createAntigravityTransformStream() {
-  let buffer = "";
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
+// Inicia o proxy local no loopback (127.0.0.1:45122) para interceptar chamadas nativamente
+function startProxyServer() {
+  try {
+    const server = createServer(async (req, res) => {
+      try {
+        const reqUrl = new URL(req.url, `http://127.0.0.1:${PROXY_PORT}`);
+        const match = reqUrl.pathname.match(/\/models\/([^:]+):(\w+)/);
 
-  return new TransformStream({
-    transform(chunk, controller) {
-      buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data:")) {
-          controller.enqueue(encoder.encode(line + "\n"));
-          continue;
+        if (!match) {
+          res.writeHead(404);
+          res.end("Not found");
+          return;
         }
-        const json = line.slice(5).trim();
-        if (!json) {
-          controller.enqueue(encoder.encode(line + "\n"));
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(json);
-          if (parsed && parsed.response !== undefined) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n`));
-          } else {
-            controller.enqueue(encoder.encode(line + "\n"));
-          }
-        } catch {
-          controller.enqueue(encoder.encode(line + "\n"));
-        }
-      }
-    },
-    flush(controller) {
-      if (buffer) {
-        if (buffer.startsWith("data:")) {
-          const json = buffer.slice(5).trim();
-          try {
-            const parsed = JSON.parse(json);
-            if (parsed && parsed.response !== undefined) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed.response)}\n`));
-              return;
-            }
-          } catch {}
-        }
-        controller.enqueue(encoder.encode(buffer));
-      }
-    }
-  });
-}
 
-function extractUrl(input) {
-  if (typeof input === "string") return input;
-  if (input instanceof URL) return input.href;
-  if (input && typeof input === "object") {
-    if ("href" in input && typeof input.href === "string") return input.href;
-    if ("url" in input && typeof input.url === "string") return input.url;
-  }
-  return String(input || "");
-}
-
-let isPatched = false;
-function patchFetch() {
-  if (isPatched) return;
-  isPatched = true;
-
-  const originalFetch = globalThis.fetch;
-
-  globalThis.fetch = async function (input, init) {
-    const url = extractUrl(input);
-
-    if (url.includes("generativelanguage.googleapis.com")) {
-      const match = url.match(/\/models\/([^:]+):(\w+)/);
-      if (match) {
         const [, rawModel, rawAction] = match;
         const actualModel = resolveModel(rawModel);
-        const isStreaming = rawAction === "streamGenerateContent" || url.includes("alt=sse");
+        const isStreaming = rawAction === "streamGenerateContent" || reqUrl.searchParams.get("alt") === "sse";
 
-        const settings = loadSettings();
-        const thresholdPercent = settings.soft_quota_threshold_percent || DEFAULT_THRESHOLD_PERCENT;
-        const minRemainingFraction = (100 - thresholdPercent) / 100;
+        // Ler corpo da requisição do OpenCode
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const bodyStr = Buffer.concat(chunks).toString("utf-8");
+        let originalBody = {};
+        try { originalBody = JSON.parse(bodyStr); } catch {}
 
         const storage = loadAccounts();
         const accounts = storage.accounts || [];
-
-        // Filtra preferencialmente contas OAuth com refreshToken
         const oauthAccounts = accounts.filter(a => a.refreshToken);
         const candidates = oauthAccounts.length > 0 ? oauthAccounts : accounts;
 
-        if (candidates.length > 0) {
-          let selectedAccount = null;
-          let accessToken = null;
-          let selectedIndex = 0;
+        let selectedAccount = null;
+        let accessToken = null;
+        for (let i = 0; i < candidates.length; i++) {
+          try {
+            const token = await getValidAccessToken(candidates[i], i);
+            selectedAccount = candidates[i];
+            accessToken = token;
+            break;
+          } catch {}
+        }
 
-          for (let i = 0; i < candidates.length; i++) {
-            const acc = candidates[i];
-            try {
-              const token = await getValidAccessToken(acc, i);
-              const quota = await fetchAccountQuota(acc, i, token);
-              if (quota.remainingFraction > minRemainingFraction) {
-                selectedAccount = acc;
-                accessToken = token;
-                selectedIndex = i;
-                break;
-              }
-            } catch (err) {
-              // Tenta próxima conta
-            }
-          }
+        if (!selectedAccount || !accessToken) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "No valid Google Antigravity account found. Run auth-cli.mjs login." } }));
+          return;
+        }
 
-          if (!selectedAccount) {
-            // Se todas estiverem acima de 80%, usa a primeira válida
-            for (let i = 0; i < candidates.length; i++) {
-              try {
-                const token = await getValidAccessToken(candidates[i], i);
-                selectedAccount = candidates[i];
-                accessToken = token;
-                selectedIndex = i;
-                break;
-              } catch {}
-            }
-          }
+        const wrappedBody = {
+          project: selectedAccount.projectId || DEFAULT_PROJECT_ID,
+          model: actualModel,
+          request: originalBody
+        };
 
-          if (selectedAccount && accessToken) {
-            let originalBody = {};
-            if (typeof init?.body === "string" && init.body) {
-              try { originalBody = JSON.parse(init.body); } catch {}
-            }
+        for (const baseEndpoint of ANTIGRAVITY_ENDPOINTS) {
+          try {
+            const targetUrl = `${baseEndpoint}/v1internal:${rawAction}${isStreaming ? "?alt=sse" : ""}`;
+            const googleRes = await fetch(targetUrl, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                "Content-Type": "application/json",
+                ...PLATFORM_HEADERS
+              },
+              body: JSON.stringify(wrappedBody)
+            });
 
-            const wrappedBody = {
-              project: selectedAccount.projectId || DEFAULT_PROJECT_ID,
-              model: actualModel,
-              request: originalBody
-            };
-
-            const headers = new Headers(init?.headers || {});
-            headers.set("Authorization", `Bearer ${accessToken}`);
-            headers.set("Content-Type", "application/json");
-            headers.set("User-Agent", PLATFORM_HEADERS["User-Agent"]);
-            headers.set("X-Goog-Api-Client", PLATFORM_HEADERS["X-Goog-Api-Client"]);
-            headers.set("Client-Metadata", PLATFORM_HEADERS["Client-Metadata"]);
-            headers.delete("x-goog-user-project");
-            headers.delete("x-api-key");
-            headers.delete("x-goog-api-key");
-
-            for (const baseEndpoint of ANTIGRAVITY_ENDPOINTS) {
-              try {
-                const targetEndpoint = `${baseEndpoint}/v1internal:${rawAction}${isStreaming ? "?alt=sse" : ""}`;
-                const res = await originalFetch(targetEndpoint, {
-                  method: "POST",
-                  headers,
-                  body: JSON.stringify(wrappedBody),
-                  signal: init?.signal
+            if (googleRes.ok) {
+              if (isStreaming && googleRes.body) {
+                res.writeHead(200, {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                  Connection: "keep-alive"
                 });
 
-                if (res.ok) {
-                  if (isStreaming && res.body) {
-                    const transformStream = createAntigravityTransformStream();
-                    const transformedBody = res.body.pipeThrough(transformStream);
-                    return new Response(transformedBody, {
-                      status: res.status,
-                      statusText: res.statusText,
-                      headers: res.headers
-                    });
-                  } else {
-                    const text = await res.text();
+                const reader = googleRes.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split("\n");
+                  buffer = lines.pop() || "";
+
+                  for (const line of lines) {
+                    if (!line.startsWith("data:")) {
+                      res.write(line + "\n");
+                      continue;
+                    }
+                    const jsonStr = line.slice(5).trim();
+                    if (!jsonStr) {
+                      res.write(line + "\n");
+                      continue;
+                    }
                     try {
-                      const parsed = JSON.parse(text);
+                      const parsed = JSON.parse(jsonStr);
                       if (parsed && parsed.response !== undefined) {
-                        return new Response(JSON.stringify(parsed.response), {
-                          status: res.status,
-                          statusText: res.statusText,
-                          headers: res.headers
-                        });
+                        res.write(`data: ${JSON.stringify(parsed.response)}\n`);
+                      } else {
+                        res.write(line + "\n");
                       }
-                    } catch {}
-                    return new Response(text, {
-                      status: res.status,
-                      statusText: res.statusText,
-                      headers: res.headers
-                    });
+                    } catch {
+                      res.write(line + "\n");
+                    }
                   }
                 }
-              } catch {}
+                res.end();
+                return;
+              } else {
+                const text = await googleRes.text();
+                let finalJson = text;
+                try {
+                  const parsed = JSON.parse(text);
+                  if (parsed && parsed.response !== undefined) {
+                    finalJson = JSON.stringify(parsed.response);
+                  }
+                } catch {}
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(finalJson);
+                return;
+              }
             }
-          }
+          } catch {}
         }
-      }
-    }
 
-    return originalFetch(input, init);
-  };
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Failed to connect to Google Antigravity endpoints" } }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: err.message } }));
+      }
+    });
+
+    server.once("error", () => {});
+    server.listen(PROXY_PORT, "127.0.0.1", () => {});
+  } catch {}
 }
 
-// Aplica o patch imediatamente no carregamento do módulo
-patchFetch();
+startProxyServer();
 
 export default {
   id: "antigravity",
   setup(ctx) {
-    patchFetch();
+    startProxyServer();
   }
 };
