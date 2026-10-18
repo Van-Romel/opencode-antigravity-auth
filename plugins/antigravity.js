@@ -2,7 +2,6 @@ import { createServer } from "node:http";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { execSync } from "node:child_process";
 
 // Public Google Cloud Code / Antigravity Desktop OAuth Client credentials issued by Google LLC.
 // NOTE: This is NOT a personal API key, user token, or private secret. It is Google's official public
@@ -62,16 +61,6 @@ function loadSettings() {
 function resolveEnv(name) {
   if (process.env[name] && process.env[name].trim()) {
     return process.env[name].trim();
-  }
-  if (process.platform === "win32") {
-    try {
-      const out = execSync(`reg query HKCU\\Environment /v ${name}`, { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-      const line = out.split(/\r?\n/).find(l => l.includes(name));
-      if (line) {
-        const val = line.trim().split(/\s+/).pop();
-        if (val) return val.trim();
-      }
-    } catch {}
   }
   return null;
 }
